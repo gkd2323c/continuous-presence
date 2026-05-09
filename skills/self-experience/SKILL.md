@@ -9,8 +9,12 @@ description: 你安装了 Continuous Presence 插件，它让 AI 能查询自己
 
 ## 可用工具
 
-- **`continuous-presence_recall-context`**：输入话题，返回相关历史会话的摘要、工具使用和踩坑记录。当感觉「这个问题之前遇到过」时主动调用。
-- **`continuous-presence_session-summary`**：查看今日/本周/本月会话概览与统计。适合用来快速回顾最近处理过什么。
+- **`continuous-presence_recall-context`**：输入话题，返回相关历史会话的摘要、工具使用和踩坑记录，以及相关工作流模式。当感觉「这个问题之前遇到过」时主动调用。
+- **`continuous-presence_session-summary`**：查看今日/本周/本月会话概览与统计，以及常见工作流模式排名。适合用来快速回顾最近处理过什么。
+
+## 工作流模式
+
+插件还会分析工具调用的先后顺序，发现反复出现的**工作流模式**。当你查询某个话题时，`recall-context` 会额外展示相关的工作流模式——不仅告诉你「之前聊过」，还告诉你「上次是怎么一步步做的」。
 
 ## 使用原则
 

@@ -6,6 +6,7 @@
  */
 import path from "node:path";
 import { createScanner } from "./lib/session-scanner.js";
+import { extractPatterns } from "./lib/pattern-extractor.js";
 
 export default class ContinuousPresencePlugin {
   /** @type {import("./lib/session-scanner.js").SessionScanner | null} */
@@ -32,6 +33,7 @@ export default class ContinuousPresencePlugin {
     });
 
     await this.#scanner.scan();
+    await this.#runPatternExtraction();
     this.#log.info("initial scan complete");
 
     // 每 15 分钟增量扫描一次
@@ -45,6 +47,7 @@ export default class ContinuousPresencePlugin {
     this.register(
       bus.handle("continuous-presence:scan", async () => {
         await this.#scanner.scan();
+        await this.#runPatternExtraction();
         return { ok: true };
       })
     );
@@ -166,6 +169,30 @@ export default class ContinuousPresencePlugin {
           lines.push("");
         }
 
+        // 查找相关的工作流模式
+        const idx = this.#scanner?.getIndex();
+        if (idx?.patterns?.length) {
+          const queryWords = (input.query || "").toLowerCase().split(/\s+/).filter(Boolean);
+          const matchedPatterns = idx.patterns.filter((p) => {
+            if (!p.sequence?.length) return false;
+            const seqStr = p.sequence.join(" ").toLowerCase();
+            const topicStr = (p.topics || []).join(" ").toLowerCase();
+            return queryWords.some((qw) => seqStr.includes(qw) || topicStr.includes(qw));
+          });
+
+          if (matchedPatterns.length > 0) {
+            lines.push(`📋 相关工作流模式（${matchedPatterns.length} 个）：\n`);
+            for (const p of matchedPatterns.slice(0, 3)) {
+              lines.push(`  ${p.sequence.join(" → ")}`);
+              lines.push(`    出现在 ${p.sessionCount} 次会话中，涉及：${(p.topics || []).slice(0, 4).join("、")}`);
+              if (p.errors?.length) {
+                lines.push(`    常见错误：${p.errors[0].slice(0, 80)}`);
+              }
+              lines.push("");
+            }
+          }
+        }
+
         return lines.join("\n");
       },
     });
@@ -271,6 +298,18 @@ export default class ContinuousPresencePlugin {
           lines.push(`  ... 还有 ${matched.length - 20} 条`);
         }
 
+        // 显示工作流模式
+        const idx = this.#scanner?.getIndex();
+        if (idx?.patterns?.length) {
+          const topPatterns = idx.patterns.slice(0, 5);
+          lines.push("");
+          lines.push(`📋 常见工作流模式（Top ${topPatterns.length}）：`);
+          for (const p of topPatterns) {
+            lines.push(`  ${p.sequence.join(" → ")}`);
+            lines.push(`    ${p.sessionCount} 次会话 | 得分 ${p.score}`);
+          }
+        }
+
         return lines.join("\n");
       },
     });
@@ -280,6 +319,25 @@ export default class ContinuousPresencePlugin {
     this.register(unreg2);
 
     this.#log.info("continuous-presence ready");
+  }
+
+  /** 扫描完成后运行模式提取，将结果写入索引并持久化 */
+  async #runPatternExtraction() {
+    const index = this.#scanner?.getIndex();
+    if (!index) return;
+
+    const { patterns, errors: toolErrors } = extractPatterns(index, this.#log);
+    index.patterns = patterns;
+    index.toolErrors = toolErrors;
+
+    // 持久化
+    try {
+      const { writeFileSync } = await import("node:fs");
+      const indexFile = path.join(this.ctx.dataDir, "index.json");
+      writeFileSync(indexFile, JSON.stringify(index, null, 2), "utf-8");
+    } catch (err) {
+      this.#log.error("failed to persist patterns:", err);
+    }
   }
 
   async onunload() {
