@@ -1,0 +1,8 @@
+# 运行时数据
+plugin-data/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

@@ -1,0 +1,8 @@
+{
+  "id": "continuous-presence",
+  "name": "Continuous Presence",
+  "version": "0.1.0",
+  "description": "在后台扫描历史会话，构建经验索引，让我在对话中主动回想「过去怎么处理过类似问题」。不做未经同意的上下文注入。",
+  "trust": "full-access",
+  "minAppVersion": "0.82.0"
+}
