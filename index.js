@@ -89,7 +89,7 @@ export default class ContinuousPresencePlugin {
       execute: async (input, toolCtx) => {
         const index = this.#scanner?.getIndex();
         if (!index || !index.sessions || Object.keys(index.sessions).length === 0) {
-          return "历史会话索引还未建立，请稍后再试。";
+          return { content: [{ type: "text", text: "历史会话索引还未建立，请稍后再试。" }] };
         }
 
         const query = (input.query || "").toLowerCase();
@@ -132,7 +132,7 @@ export default class ContinuousPresencePlugin {
         const top = scored.slice(0, maxResults);
 
         if (top.length === 0) {
-          return `没有找到与「${input.query}」相关的历史会话。`;
+          return { content: [{ type: "text", text: `没有找到与「${input.query}」相关的历史会话。` }] };
         }
 
         // 格式化输出
@@ -193,7 +193,7 @@ export default class ContinuousPresencePlugin {
           }
         }
 
-        return lines.join("\n");
+        return { content: [{ type: "text", text: lines.join("\n") }] };
       },
     });
 
@@ -219,7 +219,7 @@ export default class ContinuousPresencePlugin {
       execute: async (input, toolCtx) => {
         const index = this.#scanner?.getIndex();
         if (!index || !index.sessions || Object.keys(index.sessions).length === 0) {
-          return "历史会话索引还未建立。";
+          return { content: [{ type: "text", text: "历史会话索引还未建立。" }] };
         }
 
         const period = input.period || "today";
@@ -247,7 +247,7 @@ export default class ContinuousPresencePlugin {
           });
 
         if (matched.length === 0) {
-          return `最近 ${period} 内没有历史会话。`;
+          return { content: [{ type: "text", text: `最近 ${period} 内没有历史会话。` }] };
         }
 
         // 统计
@@ -310,7 +310,7 @@ export default class ContinuousPresencePlugin {
           }
         }
 
-        return lines.join("\n");
+        return { content: [{ type: "text", text: lines.join("\n") }] };
       },
     });
 
