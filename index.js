@@ -7,11 +7,15 @@
 import path from "node:path";
 import { createScanner } from "./lib/session-scanner.js";
 import { extractPatterns } from "./lib/pattern-extractor.js";
+import { createSceneBuilder } from "./lib/scene-builder.js";
 
 export default class ContinuousPresencePlugin {
   /** @type {import("./lib/session-scanner.js").SessionScanner | null} */
   #scanner = null;
+  /** @type {import("./lib/scene-builder.js").SceneBuilder | null} */
+  #sceneBuilder = null;
   #scanTimer = null;
+  #sceneUpdateTimer = null;
   #log = null;
 
   async onload() {
@@ -19,12 +23,14 @@ export default class ContinuousPresencePlugin {
 
     const { dataDir, bus } = this.ctx;
     const agentsDir = path.resolve(dataDir, "..", "..", "agents");
+    const sceneDir = path.join(dataDir, "scene_blocks");
 
     this.#log.info(`continuous-presence loading`);
     this.#log.info(`  dataDir: ${dataDir}`);
     this.#log.info(`  agentsDir: ${agentsDir}`);
+    this.#log.info(`  sceneDir: ${sceneDir}`);
 
-    // 创建扫描器并执行初始全量扫描
+    // 创建扫描器
     this.#scanner = await createScanner({
       agentsDir,
       agentId: "hanako",
@@ -32,9 +38,17 @@ export default class ContinuousPresencePlugin {
       log: this.#log,
     });
 
+    // 创建场景块构建器
+    this.#sceneBuilder = await createSceneBuilder({
+      sceneDir,
+      log: this.#log,
+    });
+
+    // 初始全量扫描 + 场景构建
     await this.#scanner.scan();
     await this.#runPatternExtraction();
-    this.#log.info("initial scan complete");
+    await this.#rebuildScenes();
+    this.#log.info("initial scan + scene build complete");
 
     // 每 15 分钟增量扫描一次
     this.#scanTimer = setInterval(() => {
@@ -43,12 +57,28 @@ export default class ContinuousPresencePlugin {
       });
     }, 15 * 60 * 1000);
 
-    // 注册 bus handler：其他插件或工具可以请求强制重新扫描
+    // 每 60 分钟增量更新场景块（场景更新频率低于扫描）
+    this.#sceneUpdateTimer = setInterval(() => {
+      this.#rebuildScenes().catch((err) => {
+        this.#log.error("scene rebuild failed:", err);
+      });
+    }, 60 * 60 * 1000);
+
+    // 注册 bus handler
     this.register(
       bus.handle("continuous-presence:scan", async () => {
         await this.#scanner.scan();
         await this.#runPatternExtraction();
+        await this.#rebuildScenes();
         return { ok: true };
+      })
+    );
+
+    // 注册场景重建 handler
+    this.register(
+      bus.handle("continuous-presence:rebuild-scenes", async () => {
+        await this.#rebuildScenes();
+        return { ok: true, scenes: this.#sceneBuilder?.listScenes().length || 0 };
       })
     );
 
@@ -167,6 +197,33 @@ export default class ContinuousPresencePlugin {
           lines.push(`  摘要：${session.summary || "(无文本)"}`);
           lines.push(`  相关度：${score}`);
           lines.push("");
+        }
+
+        // 查找相关的场景块（L2）
+        const scenes = this.#sceneBuilder?.listScenes() || [];
+        if (scenes.length > 0) {
+          const queryWords = (input.query || "").toLowerCase().split(/\s+/).filter(Boolean);
+          const matchedScenes = scenes
+            .filter(s => {
+              if (s.archived) return false;
+              const topicStr = (s.topics || []).join(" ").toLowerCase();
+              const titleStr = (s.title || "").toLowerCase();
+              return queryWords.some(qw => topicStr.includes(qw) || titleStr.includes(qw));
+            })
+            .slice(0, 3);
+
+          if (matchedScenes.length > 0) {
+            lines.push(`📂 相关场景块（${matchedScenes.length} 个）：\n`);
+            for (const s of matchedScenes) {
+              lines.push(`  ${s.title}`);
+              lines.push(`    话题：${(s.topics || []).slice(0, 6).join("、")}`);
+              lines.push(`    重要性：${s.importance} | 涉及 ${s.sessions} 次会话`);
+              if (s.tools?.length) {
+                lines.push(`    常用工具：${s.tools.slice(0, 6).join(", ")}`);
+              }
+              lines.push("");
+            }
+          }
         }
 
         // 查找相关的工作流模式
@@ -314,9 +371,104 @@ export default class ContinuousPresencePlugin {
       },
     });
 
+    // 注册第三个工具：场景块查询
+    const unreg3 = this.ctx.registerTool({
+      name: "scene-search",
+      description:
+        "查询场景块（Scene Blocks）——主题化的经验聚合。每个场景块是一组相关会话围绕同一话题的提炼，" +
+        "包含关键知识点、工具使用模式和常见踩坑。适合想了解某个话题的全貌而非单次会话时使用。" +
+        "返回匹配的场景块摘要。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "查询内容，如「Nginx」「MCP」「B站视频总结」",
+          },
+          maxResults: {
+            type: "number",
+            description: "最大返回条数（默认 5）",
+          },
+          minImportance: {
+            type: "number",
+            description: "最低重要性过滤（1-10，默认不限制）",
+          },
+          includeContent: {
+            type: "boolean",
+            description: "是否返回场景块完整 Markdown 内容（默认 false，只返回摘要）",
+          },
+        },
+        required: ["query"],
+      },
+      execute: async (input, toolCtx) => {
+        const scenes = this.#sceneBuilder?.listScenes() || [];
+        if (scenes.length === 0) {
+          return { content: [{ type: "text", text: "场景块索引还未建立。" }] };
+        }
+
+        const query = (input.query || "").toLowerCase();
+        const maxResults = Math.min(input.maxResults || 5, 20);
+        const minImportance = input.minImportance || 0;
+        const includeContent = input.includeContent === true;
+
+        const queryWords = query.split(/\s+/).filter(Boolean);
+
+        // 打分
+        const scored = [];
+        for (const scene of scenes) {
+          if (scene.archived) continue;
+          if (scene.importance < minImportance) continue;
+
+          let score = 0;
+          for (const qw of queryWords) {
+            if ((scene.title || "").toLowerCase().includes(qw)) score += 5;
+            if ((scene.topics || []).some(t => t.toLowerCase().includes(qw))) score += 4;
+            if ((scene.tools || []).some(t => t.toLowerCase().includes(qw))) score += 2;
+          }
+          if (score > 0) scored.push({ scene, score });
+        }
+
+        scored.sort((a, b) => b.score - a.score || b.scene.importance - a.scene.importance);
+        const top = scored.slice(0, maxResults);
+
+        if (top.length === 0) {
+          return { content: [{ type: "text", text: `没有找到与「${input.query}」相关的场景块。` }] };
+        }
+
+        const lines = [];
+        lines.push(`找到 ${top.length} 个相关场景块：\n`);
+
+        for (const { scene, score } of top) {
+          lines.push(`📂 ${scene.title}（重要性 ${scene.importance}）`);
+          lines.push(`  话题：${(scene.topics || []).slice(0, 8).join("、")}`);
+          lines.push(`  涉及 ${scene.sessions} 次会话，${scene.exchanges || 0} 轮对话`);
+          if (scene.tools?.length) {
+            lines.push(`  工具：${scene.tools.slice(0, 8).join(", ")}`);
+          }
+          if (scene.errors > 0) {
+            lines.push(`  记录 ${scene.errors} 个踩坑`);
+          }
+          lines.push(`  匹配度：${score}`);
+
+          if (includeContent) {
+            const content = await this.#sceneBuilder.getSceneContent(scene.id);
+            if (content) {
+              lines.push("");
+              lines.push(content.split("\n").slice(12, 40).join("\n")); // 跳过 frontmatter
+              lines.push("");
+            }
+          }
+          lines.push("");
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      },
+    });
+
     // 工具注册返回的清理函数也注册到生命周期
     this.register(unreg);
     this.register(unreg2);
+    this.register(unreg3);
 
     this.#log.info("continuous-presence ready");
   }
@@ -340,6 +492,13 @@ export default class ContinuousPresencePlugin {
     }
   }
 
+  /** 从当前索引重建所有场景块 */
+  async #rebuildScenes() {
+    const index = this.#scanner?.getIndex();
+    if (!index || !this.#sceneBuilder) return;
+    await this.#sceneBuilder.updateFromSessionIndex(index, 30);
+  }
+
   async onunload() {
     // this.register() 注册的资源自动清理
     // 只需清理框架管不到的：
@@ -347,7 +506,12 @@ export default class ContinuousPresencePlugin {
       clearInterval(this.#scanTimer);
       this.#scanTimer = null;
     }
+    if (this.#sceneUpdateTimer) {
+      clearInterval(this.#sceneUpdateTimer);
+      this.#sceneUpdateTimer = null;
+    }
     this.#scanner = null;
+    this.#sceneBuilder = null;
     this.#log.info("continuous-presence unloaded");
   }
 }
