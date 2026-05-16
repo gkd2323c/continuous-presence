@@ -8,12 +8,15 @@ import path from "node:path";
 import { createScanner } from "./lib/session-scanner.js";
 import { extractPatterns } from "./lib/pattern-extractor.js";
 import { createSceneBuilder } from "./lib/scene-builder.js";
+import { createNodeResolver, parseNodeId } from "./lib/node-resolver.js";
 
 export default class ContinuousPresencePlugin {
   /** @type {import("./lib/session-scanner.js").SessionScanner | null} */
   #scanner = null;
   /** @type {import("./lib/scene-builder.js").SceneBuilder | null} */
   #sceneBuilder = null;
+  /** @type {import("./lib/node-resolver.js").NodeResolver | null} */
+  #nodeResolver = null;
   #scanTimer = null;
   #sceneUpdateTimer = null;
   #log = null;
@@ -41,6 +44,13 @@ export default class ContinuousPresencePlugin {
     // 创建场景块构建器
     this.#sceneBuilder = await createSceneBuilder({
       sceneDir,
+      log: this.#log,
+    });
+
+    // 创建 node_id 解析器
+    const sessionsDir = path.resolve(agentsDir, "hanako", "sessions");
+    this.#nodeResolver = createNodeResolver({
+      sessionsDir,
       log: this.#log,
     });
 
@@ -193,6 +203,11 @@ export default class ContinuousPresencePlugin {
           }
           if (session.corrections?.length) {
             lines.push(`  被纠正 ${session.corrections.length} 次`);
+          }
+          // 添加 node_id 可追溯引用
+          const sessionId = extractSessionIdFromPathSimple(relPath);
+          if (sessionId) {
+            lines.push(`  追溯：\`node:${sessionId}:first-msg\`（复制后用 resolve-node 查看原文）`);
           }
           lines.push(`  摘要：${session.summary || "(无文本)"}`);
           lines.push(`  相关度：${score}`);
@@ -465,10 +480,88 @@ export default class ContinuousPresencePlugin {
       },
     });
 
+    // 注册第四个工具：node_id 解析
+    const unreg4 = this.ctx.registerTool({
+      name: "resolve-node",
+      description:
+        "通过 node_id 追溯消息原文。每条消息有一个唯一 node_id（格式：{sessionId}:{messageId}），" +
+        "输入 node_id 即可查看该条消息的原文内容。" +
+        "场景块和回忆结果中会标注可追溯的 node_id。",
+      parameters: {
+        type: "object",
+        properties: {
+          nodeId: {
+            type: "string",
+            description: "node_id，格式为 {sessionId}:{messageId}，如 019e00cc-4786-726d-a126-d67721cfc818:504c4d9f",
+          },
+          contextLines: {
+            type: "number",
+            description: "返回的前后文消息条数（默认 0）",
+          },
+        },
+        required: ["nodeId"],
+      },
+      execute: async (input, toolCtx) => {
+        const resolver = this.#nodeResolver;
+        if (!resolver) {
+          return { content: [{ type: "text", text: "节点解析器还未就绪。" }] };
+        }
+
+        const nodeId = (input.nodeId || "").trim();
+        if (!nodeId) {
+          return { content: [{ type: "text", text: "请提供 node_id。" }] };
+        }
+
+        // 支持简写: 如果 nodeId 不含 :，尝试定位
+        const parsed = parseNodeId(nodeId);
+        if (!parsed) {
+          return { content: [{ type: "text", text: `无效的 node_id 格式：${nodeId}。应为 {sessionId}:{messageId}。` }] };
+        }
+
+        const ctxLines = Math.min(Math.max(0, input.contextLines || 0), 10);
+        const result = await resolver.resolve(nodeId, { contextLines: ctxLines });
+
+        if (!result) {
+          return { content: [{ type: "text", text: `未找到 node_id 对应的消息：${nodeId}。` }] };
+        }
+
+        const lines = [];
+        lines.push(`📎 node_id: ${result.nodeId}`);
+        lines.push(`角色: ${result.role === "user" ? "👤 用户" : "🤖 Assistant"}`);
+        lines.push(`时间: ${result.timestamp || "未知"}`);
+        lines.push("");
+
+        if (result.prev?.length) {
+          lines.push(`← 前文（${result.prev.length} 条）：`);
+          for (const p of result.prev) {
+            const snippet = p.slice(0, 200).replace(/\n/g, " ");
+            lines.push(`  ${snippet}`);
+          }
+          lines.push("");
+        }
+
+        lines.push("原文：");
+        lines.push(result.text || "(无文本)");
+        lines.push("");
+
+        if (result.next?.length) {
+          lines.push(`→ 后文（${result.next.length} 条）：`);
+          for (const n of result.next) {
+            const snippet = n.slice(0, 200).replace(/\n/g, " ");
+            lines.push(`  ${snippet}`);
+          }
+          lines.push("");
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      },
+    });
+
     // 工具注册返回的清理函数也注册到生命周期
     this.register(unreg);
     this.register(unreg2);
     this.register(unreg3);
+    this.register(unreg4);
 
     this.#log.info("continuous-presence ready");
   }
@@ -512,6 +605,23 @@ export default class ContinuousPresencePlugin {
     }
     this.#scanner = null;
     this.#sceneBuilder = null;
+    this.#nodeResolver = null;
     this.#log.info("continuous-presence unloaded");
   }
+}
+
+/**
+ * 从会话文件路径中提取 session_id（用于 recall-context 的 node_id 追溯）
+ */
+function extractSessionIdFromPathSimple(filePath) {
+  const base = filePath.replace(/\.jsonl$/i, "").split(/[\\\/]/).pop() || "";
+  if (!base) return null;
+  const parts = base.split("_");
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(p)) {
+      return p;
+    }
+  }
+  return parts.length > 1 ? parts.slice(1).join("_") : parts[0] || null;
 }
