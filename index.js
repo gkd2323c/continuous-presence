@@ -5,10 +5,12 @@
  * 不主动注入任何上下文，只被动查询。
  */
 import path from "node:path";
+import fsp from "node:fs/promises";
 import { createScanner } from "./lib/session-scanner.js";
 import { extractPatterns } from "./lib/pattern-extractor.js";
 import { createSceneBuilder } from "./lib/scene-builder.js";
 import { createNodeResolver, parseNodeId } from "./lib/node-resolver.js";
+import { createPersonaGenerator } from "./lib/persona-generator.js";
 
 export default class ContinuousPresencePlugin {
   /** @type {import("./lib/session-scanner.js").SessionScanner | null} */
@@ -17,8 +19,11 @@ export default class ContinuousPresencePlugin {
   #sceneBuilder = null;
   /** @type {import("./lib/node-resolver.js").NodeResolver | null} */
   #nodeResolver = null;
+  /** @type {import("./lib/persona-generator.js").PersonaGenerator | null} */
+  #personaGenerator = null;
   #scanTimer = null;
   #sceneUpdateTimer = null;
+  #personaTimer = null;
   #log = null;
 
   async onload() {
@@ -54,11 +59,18 @@ export default class ContinuousPresencePlugin {
       log: this.#log,
     });
 
-    // 初始全量扫描 + 场景构建
+    // 创建 Persona 生成器
+    this.#personaGenerator = await createPersonaGenerator({
+      personaDir: dataDir,
+      log: this.#log,
+    });
+
+    // 初始全量扫描 + 场景构建 + Persona 生成
     await this.#scanner.scan();
     await this.#runPatternExtraction();
     await this.#rebuildScenes();
-    this.#log.info("initial scan + scene build complete");
+    await this.#generatePersona();
+    this.#log.info("initial scan + scene build + persona complete");
 
     // 每 15 分钟增量扫描一次
     this.#scanTimer = setInterval(() => {
@@ -67,12 +79,20 @@ export default class ContinuousPresencePlugin {
       });
     }, 15 * 60 * 1000);
 
-    // 每 60 分钟增量更新场景块（场景更新频率低于扫描）
+    // 每 60 分钟增量更新场景块 + Persona
     this.#sceneUpdateTimer = setInterval(() => {
       this.#rebuildScenes().catch((err) => {
         this.#log.error("scene rebuild failed:", err);
       });
     }, 60 * 60 * 1000);
+
+    // 每 120 分钟更新 Persona（Persona 更新频率低于场景块）
+    // Persona 生成随 #rebuildScenes 也触发，但额外定时确保即使场景未变也能更新
+    this.#personaTimer = setInterval(() => {
+      this.#generatePersona().catch((err) => {
+        this.#log.error("persona generation failed:", err);
+      });
+    }, 120 * 60 * 1000);
 
     // 注册 bus handler
     this.register(
@@ -80,6 +100,7 @@ export default class ContinuousPresencePlugin {
         await this.#scanner.scan();
         await this.#runPatternExtraction();
         await this.#rebuildScenes();
+        await this.#generatePersona();
         return { ok: true };
       })
     );
@@ -88,7 +109,16 @@ export default class ContinuousPresencePlugin {
     this.register(
       bus.handle("continuous-presence:rebuild-scenes", async () => {
         await this.#rebuildScenes();
+        await this.#generatePersona();
         return { ok: true, scenes: this.#sceneBuilder?.listScenes().length || 0 };
+      })
+    );
+
+    // 注册 Persona 重建 handler
+    this.register(
+      bus.handle("continuous-presence:generate-persona", async () => {
+        await this.#generatePersona();
+        return { ok: true };
       })
     );
 
@@ -651,10 +681,29 @@ export default class ContinuousPresencePlugin {
       },
     });
 
+    // 注册第五个工具：Persona 生成（L3 用户画像）
+    const unreg5 = this.ctx.registerTool({
+      name: "get-persona",
+      description:
+        "查看当前用户画像。用户画像是从历史会话和场景块中自动提炼的个人偏好、技术倾向、工作模式和常见踩坑的总结。" +
+        "属于 L3 层——最抽象的记忆层。需要了解用户的长期偏好和习惯时调用。",
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+      execute: async (input, toolCtx) => {
+        const content = await this.#personaGenerator?.getPersonaContent();
+        if (!content) {
+          return { content: [{ type: "text", text: "用户画像还未生成。" }] };
+        }
+        return { content: [{ type: "text", text: content }] };
+      },
+    });
+
     // 清理函数注册推迟到所有工具注册完成后
 
-    // 注册第五个工具：node_id 解析（渐进披露 L3 — 底层追溯）
-    const unreg5 = this.ctx.registerTool({
+    // 注册第六个工具：node_id 解析（渐进披露 L3 — 底层追溯）
+    const unreg6 = this.ctx.registerTool({
       name: "resolve-node",
       description:
         "通过 node_id 追溯消息原文。每条消息有一个唯一 node_id（格式：{sessionId}:{messageId}），" +
@@ -736,6 +785,7 @@ export default class ContinuousPresencePlugin {
     this.register(unreg3);
     this.register(unreg4);
     this.register(unreg5);
+    this.register(unreg6);
 
     this.#log.info("continuous-presence ready");
   }
@@ -766,6 +816,20 @@ export default class ContinuousPresencePlugin {
     await this.#sceneBuilder.updateFromSessionIndex(index, 30);
   }
 
+  /** 从当前数据生成 Persona */
+  async #generatePersona() {
+    const index = this.#scanner?.getIndex();
+    if (!index || !this.#personaGenerator) return;
+    const scenes = this.#sceneBuilder?.listScenes()?.filter(s => !s.archived) || [];
+    // 尝试读取置顶记忆
+    let pinnedMd = null;
+    const pinnedPath = path.join(process.env.HOME || "", ".hanako", "pinned.md");
+    try {
+      pinnedMd = await fsp.readFile(pinnedPath, "utf-8");
+    } catch {}
+    await this.#personaGenerator.generate(index, scenes, pinnedMd);
+  }
+
   async onunload() {
     // this.register() 注册的资源自动清理
     // 只需清理框架管不到的：
@@ -777,9 +841,14 @@ export default class ContinuousPresencePlugin {
       clearInterval(this.#sceneUpdateTimer);
       this.#sceneUpdateTimer = null;
     }
+    if (this.#personaTimer) {
+      clearInterval(this.#personaTimer);
+      this.#personaTimer = null;
+    }
     this.#scanner = null;
     this.#sceneBuilder = null;
     this.#nodeResolver = null;
+    this.#personaGenerator = null;
     this.#log.info("continuous-presence unloaded");
   }
 }
