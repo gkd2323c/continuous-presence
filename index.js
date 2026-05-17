@@ -86,13 +86,12 @@ export default class ContinuousPresencePlugin {
       });
     }, 60 * 60 * 1000);
 
-    // 每 120 分钟更新 Persona（Persona 更新频率低于场景块）
-    // Persona 生成随 #rebuildScenes 也触发，但额外定时确保即使场景未变也能更新
+    // 每 60 分钟更新规则版 Persona
     this.#personaTimer = setInterval(() => {
-      this.#generatePersona().catch((err) => {
+      this.#generatePersona(false).catch((err) => {
         this.#log.error("persona generation failed:", err);
       });
-    }, 120 * 60 * 1000);
+    }, 60 * 60 * 1000);
 
     // 注册 bus handler
     this.register(
@@ -686,12 +685,22 @@ export default class ContinuousPresencePlugin {
       name: "get-persona",
       description:
         "查看当前用户画像。用户画像是从历史会话和场景块中自动提炼的个人偏好、技术倾向、工作模式和常见踩坑的总结。" +
-        "属于 L3 层——最抽象的记忆层。需要了解用户的长期偏好和习惯时调用。",
+        "属于 L3 层——最抽象的记忆层。需要了解用户的长期偏好和习惯时调用。" +
+        "可选参数 useLlm=true 可使用 LLM 增强洞察（更深入但需要等待数十秒）。",
       parameters: {
         type: "object",
-        properties: {},
+        properties: {
+          useLlm: {
+            type: "boolean",
+            description: "是否使用 LLM 增强洞察（默认 false）。设为 true 时会读取统计数据并让 LLM 生成更深入的用户画像。",
+          },
+        },
       },
       execute: async (input, toolCtx) => {
+        const useLlm = input.useLlm === true;
+        if (useLlm) {
+          await this.#generatePersona(true);
+        }
         const content = await this.#personaGenerator?.getPersonaContent();
         if (!content) {
           return { content: [{ type: "text", text: "用户画像还未生成。" }] };
@@ -817,7 +826,7 @@ export default class ContinuousPresencePlugin {
   }
 
   /** 从当前数据生成 Persona */
-  async #generatePersona() {
+  async #generatePersona(useLlm = false) {
     const index = this.#scanner?.getIndex();
     if (!index || !this.#personaGenerator) return;
     const scenes = this.#sceneBuilder?.listScenes()?.filter(s => !s.archived) || [];
@@ -827,7 +836,29 @@ export default class ContinuousPresencePlugin {
     try {
       pinnedMd = await fsp.readFile(pinnedPath, "utf-8");
     } catch {}
-    await this.#personaGenerator.generate(index, scenes, pinnedMd);
+
+    // 尝试读取 LLM 配置（从 OpenClaw 配置或环境变量）
+    let llmConfig = null;
+    if (useLlm) {
+      try {
+        const openclawConfigPath = path.join(process.env.HOME || "", ".openclaw", "openclaw.json");
+        const raw = await fsp.readFile(openclawConfigPath, "utf-8");
+        const config = JSON.parse(raw);
+        const provider = config?.models?.providers?.opencode;
+        if (provider?.baseUrl && provider?.apiKey) {
+          llmConfig = {
+            baseUrl: provider.baseUrl.replace(/\/+$/, ""),
+            apiKey: provider.apiKey,
+            model: provider.models?.[0]?.id || "deepseek-v4-flash",
+          };
+          this.#log?.info("[persona] LLM config loaded from openclaw.json");
+        }
+      } catch (err) {
+        this.#log?.warn(`[persona] failed to load LLM config: ${err.message}`);
+      }
+    }
+
+    await this.#personaGenerator.generate(index, scenes, pinnedMd, llmConfig);
   }
 
   async onunload() {

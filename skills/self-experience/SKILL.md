@@ -60,6 +60,8 @@ resolve-node(nodeId: "019e00cc-...:504c4d9f", contextLines: 2)
 | L2 | `scene-search(includeContent=true)` | 想读完整场景块 Markdown |
 | L2 | `session-summary` | 回顾今天/本周做过什么 |
 | L3 | `resolve-node(nodeId)` | 需要核实某条消息的原话 |
+| L3 | `get-persona()` | 查看用户画像（规则版，瞬时） |
+| L3 | `get-persona(useLlm: true)` | 查看用户画像（LLM 增强版，需 20-30 秒） |
 
 ## 工作流模式
 
