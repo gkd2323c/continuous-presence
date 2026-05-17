@@ -107,7 +107,8 @@ export default class ContinuousPresencePlugin {
     const unreg = this.ctx.registerTool({
       name: "recall-context",
       description:
-        "查询我过去的对话经验。当我感觉「之前遇到过类似问题」但又记不清时调用，或者你主动问「你之前处理过 XXX 吗」时使用。返回与查询相关度最高的历史会话摘要。",
+        "[渐进披露 L2] 查询历史会话经验。返回与查询相关的场景块摘要和会话记录。" +
+        "常用搭配：先用 probe-context（L1）做顶层扫描，如果发现相关场景再用本工具下钻到会话级详情。",
       parameters: {
         type: "object",
         properties: {
@@ -123,9 +124,12 @@ export default class ContinuousPresencePlugin {
             type: "number",
             description: "限定查询最近多少天内的会话（不填则查全部）",
           },
-        },
-        required: ["query"],
-      },
+          detail: {
+            type: "string",
+            description: "输出详略度：\n" +
+              "- \"scene\"（默认）: 场景块摘要 + 场景引用（适合快速了解话题全貌）\n" +
+              "- \"session\": 逐条会话详情（适合需要看到具体对话内容）\n" +
+              "- \"full\": 完整输出，包含场景块、会话详情、工作流模式
       execute: async (input, toolCtx) => {
         const index = this.#scanner?.getIndex();
         if (!index || !index.sessions || Object.keys(index.sessions).length === 0) {
@@ -135,6 +139,7 @@ export default class ContinuousPresencePlugin {
         const query = (input.query || "").toLowerCase();
         const maxResults = Math.min(input.maxResults || 5, 20);
         const days = input.days ? parseInt(input.days, 10) : null;
+        const detail = (input.detail || "scene").toLowerCase();
 
         const cutoff = days ? Date.now() - days * 86400000 : 0;
 
@@ -175,92 +180,156 @@ export default class ContinuousPresencePlugin {
           return { content: [{ type: "text", text: `没有找到与「${input.query}」相关的历史会话。` }] };
         }
 
-        // 格式化输出
+        // 渐进披露：根据 detail 参数选择输出层
         const lines = [];
-        lines.push(`找到 ${top.length} 条相关历史经验：\n`);
 
-        for (const { relPath, session, score } of top) {
-          const date = session.timestamp
-            ? new Date(session.timestamp).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-            : "未知时间";
-          const title = session.title || "(无标题)";
-          const topicStr = session.userTopics?.length
-            ? `话题：${session.userTopics.join("、")}`
-            : "";
-
-          lines.push(`【${title}】`);
-          lines.push(`  时间：${date}`);
-          if (topicStr) lines.push(`  ${topicStr}`);
-          lines.push(`  对话轮次：${session.exchangeCount || 0}`);
-          if (session.toolsUsed?.length) {
-            lines.push(`  使用工具：${session.toolsUsed.join(", ")}`);
-          }
-          if (session.errors?.length) {
-            lines.push(`  踩坑 ${session.errors.length} 个`);
-            // 显示第一个错误摘要
-            const firstErr = session.errors[0];
-            lines.push(`  例如：${firstErr.tool} → ${firstErr.error.slice(0, 120)}`);
-          }
-          if (session.corrections?.length) {
-            lines.push(`  被纠正 ${session.corrections.length} 次`);
-          }
-          // 添加 node_id 可追溯引用
-          const sessionId = extractSessionIdFromPathSimple(relPath);
-          if (sessionId) {
-            lines.push(`  追溯：\`node:${sessionId}:first-msg\`（复制后用 resolve-node 查看原文）`);
-          }
-          lines.push(`  摘要：${session.summary || "(无文本)"}`);
-          lines.push(`  相关度：${score}`);
-          lines.push("");
-        }
-
-        // 查找相关的场景块（L2）
-        const scenes = this.#sceneBuilder?.listScenes() || [];
-        if (scenes.length > 0) {
-          const queryWords = (input.query || "").toLowerCase().split(/\s+/).filter(Boolean);
+        if (detail === "scene") {
+          // L1: 只有场景块摘要（最轻量）
+          const scenes = this.#sceneBuilder?.listScenes() || [];
+          const queryWords = query.split(/\s+/).filter(Boolean);
           const matchedScenes = scenes
-            .filter(s => {
-              if (s.archived) return false;
-              const topicStr = (s.topics || []).join(" ").toLowerCase();
-              const titleStr = (s.title || "").toLowerCase();
-              return queryWords.some(qw => topicStr.includes(qw) || titleStr.includes(qw));
+            .filter(s => !s.archived)
+            .map(s => {
+              let score = 0;
+              for (const qw of queryWords) {
+                if ((s.title || "").toLowerCase().includes(qw)) score += 5;
+                if ((s.topics || []).some(t => t.toLowerCase().includes(qw))) score += 3;
+                if ((s.tools || []).some(t => t.toLowerCase().includes(qw))) score += 2;
+              }
+              return { scene: s, score };
             })
-            .slice(0, 3);
+            .filter(x => x.score > 0)
+            .sort((a, b) => b.score - a.score || b.scene.importance - a.scene.importance)
+            .slice(0, maxResults);
 
-          if (matchedScenes.length > 0) {
-            lines.push(`📂 相关场景块（${matchedScenes.length} 个）：\n`);
-            for (const s of matchedScenes) {
-              lines.push(`  ${s.title}`);
-              lines.push(`    话题：${(s.topics || []).slice(0, 6).join("、")}`);
-              lines.push(`    重要性：${s.importance} | 涉及 ${s.sessions} 次会话`);
-              if (s.tools?.length) {
-                lines.push(`    常用工具：${s.tools.slice(0, 6).join(", ")}`);
+          if (matchedScenes.length === 0) {
+            return { content: [{ type: "text", text: `没有找到与「${input.query}」相关的场景。调 probe-context 查看所有场景，或用 detail=session 查看会话级详情。` }] };
+          }
+
+          lines.push(`📂 相关场景块（${matchedScenes.length} 个）\n`);
+          for (const { scene: s, score } of matchedScenes) {
+            lines.push(`  ${s.title} [${s.importance}/10]`);
+            lines.push(`    话题：${(s.topics || []).slice(0, 6).join("、")}`);
+            lines.push(`    涉及 ${s.sessions} 次会话 · ${s.errors} 个踩坑`);
+            lines.push(`    匹配度 ${score} · 调 scene-search(includeContent:true) 查看详情`);
+            lines.push("");
+          }
+          lines.push(`📌 当前为 L1 场景摘要，需要更详细的会话信息请将 detail 设为 "session" 或 "full"。`);
+
+        } else if (detail === "session") {
+          // L2: 会话级别详情（不含场景块）
+          lines.push(`找到 ${top.length} 条相关会话记录：\n`);
+          for (const { relPath, session, score } of top) {
+            const date = session.timestamp
+              ? new Date(session.timestamp).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+              : "未知时间";
+            const title = session.title || "(无标题)";
+            const topicStr = session.userTopics?.length ? `话题：${session.userTopics.join("、")}` : "";
+
+            lines.push(`【${title}】`);
+            lines.push(`  时间：${date}`);
+            if (topicStr) lines.push(`  ${topicStr}`);
+            lines.push(`  轮次：${session.exchangeCount || 0}`);
+            if (session.toolsUsed?.length) lines.push(`  工具：${session.toolsUsed.join(", ")}`);
+            if (session.errors?.length) {
+              lines.push(`  踩坑 ${session.errors.length} 个`);
+              lines.push(`  e.g. ${session.errors[0].tool} → ${session.errors[0].error.slice(0, 100)}`);
+            }
+            const sessionId = extractSessionIdFromPathSimple(relPath);
+            if (sessionId) lines.push(`  追溯：\`node:${sessionId}:first-msg\``);
+            lines.push(`  摘要：${session.summary || ""}`);
+            lines.push("");
+          }
+
+          // 相关工作流模式
+          const idx = this.#scanner?.getIndex();
+          if (idx?.patterns?.length) {
+            const queryWords = query.split(/\s+/).filter(Boolean);
+            const matchedPatterns = idx.patterns.filter(p => {
+              if (!p.sequence?.length) return false;
+              const seqStr = p.sequence.join(" ").toLowerCase();
+              const topicStr = (p.topics || []).join(" ").toLowerCase();
+              return queryWords.some(qw => seqStr.includes(qw) || topicStr.includes(qw));
+            }).slice(0, 3);
+            if (matchedPatterns.length > 0) {
+              lines.push(`📋 相关工作流模式：\n`);
+              for (const p of matchedPatterns) {
+                lines.push(`  ${p.sequence.join(" → ")}（${p.sessionCount} 次会话）`);
               }
               lines.push("");
             }
           }
-        }
 
-        // 查找相关的工作流模式
-        const idx = this.#scanner?.getIndex();
-        if (idx?.patterns?.length) {
-          const queryWords = (input.query || "").toLowerCase().split(/\s+/).filter(Boolean);
-          const matchedPatterns = idx.patterns.filter((p) => {
-            if (!p.sequence?.length) return false;
-            const seqStr = p.sequence.join(" ").toLowerCase();
-            const topicStr = (p.topics || []).join(" ").toLowerCase();
-            return queryWords.some((qw) => seqStr.includes(qw) || topicStr.includes(qw));
-          });
+        } else {
+          // "full": 全文输出（场景块 + 会话详情 + 工作流模式）
+          lines.push(`找到 ${top.length} 条相关历史经验：\n`);
+          for (const { relPath, session, score } of top) {
+            const date = session.timestamp
+              ? new Date(session.timestamp).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+              : "未知时间";
+            const title = session.title || "(无标题)";
+            const topicStr = session.userTopics?.length ? `话题：${session.userTopics.join("、")}` : "";
 
-          if (matchedPatterns.length > 0) {
-            lines.push(`📋 相关工作流模式（${matchedPatterns.length} 个）：\n`);
-            for (const p of matchedPatterns.slice(0, 3)) {
-              lines.push(`  ${p.sequence.join(" → ")}`);
-              lines.push(`    出现在 ${p.sessionCount} 次会话中，涉及：${(p.topics || []).slice(0, 4).join("、")}`);
-              if (p.errors?.length) {
-                lines.push(`    常见错误：${p.errors[0].slice(0, 80)}`);
+            lines.push(`【${title}】`);
+            lines.push(`  时间：${date}`);
+            if (topicStr) lines.push(`  ${topicStr}`);
+            lines.push(`  对话轮次：${session.exchangeCount || 0}`);
+            if (session.toolsUsed?.length) {
+              lines.push(`  使用工具：${session.toolsUsed.join(", ")}`);
+            }
+            if (session.errors?.length) {
+              lines.push(`  踩坑 ${session.errors.length} 个`);
+              const firstErr = session.errors[0];
+              lines.push(`  例如：${firstErr.tool} → ${firstErr.error.slice(0, 120)}`);
+            }
+            if (session.corrections?.length) {
+              lines.push(`  被纠正 ${session.corrections.length} 次`);
+            }
+            const sessionId = extractSessionIdFromPathSimple(relPath);
+            if (sessionId) {
+              lines.push(`  追溯：\`node:${sessionId}:first-msg\``);
+            }
+            lines.push(`  摘要：${session.summary || "(无文本)"}`);
+            lines.push(`  相关度：${score}`);
+            lines.push("");
+          }
+
+          const scenes = this.#sceneBuilder?.listScenes() || [];
+          if (scenes.length > 0) {
+            const qWords = query.split(/\s+/).filter(Boolean);
+            const matchedScenes = scenes
+              .filter(s => !s.archived && qWords.some(qw =>
+                (s.title || "").toLowerCase().includes(qw) ||
+                (s.topics || []).some(t => t.toLowerCase().includes(qw))))
+              .slice(0, 3);
+            if (matchedScenes.length > 0) {
+              lines.push(`📂 相关场景块（${matchedScenes.length} 个）：\n`);
+              for (const s of matchedScenes) {
+                lines.push(`  ${s.title}`);
+                lines.push(`    话题：${(s.topics || []).slice(0, 6).join("、")}`);
+                lines.push(`    重要性：${s.importance} | 涉及 ${s.sessions} 次会话`);
+                if (s.tools?.length) lines.push(`    常用工具：${s.tools.slice(0, 6).join(", ")}`);
+                lines.push("");
               }
-              lines.push("");
+            }
+          }
+
+          const idx = this.#scanner?.getIndex();
+          if (idx?.patterns?.length) {
+            const qWords = query.split(/\s+/).filter(Boolean);
+            const matchedPatterns = idx.patterns.filter(p => {
+              if (!p.sequence?.length) return false;
+              return qWords.some(qw =>
+                p.sequence.join(" ").toLowerCase().includes(qw) ||
+                (p.topics || []).join(" ").toLowerCase().includes(qw));
+            }).slice(0, 3);
+            if (matchedPatterns.length > 0) {
+              lines.push(`📋 相关工作流模式（${matchedPatterns.length} 个）：\n`);
+              for (const p of matchedPatterns) {
+                lines.push(`  ${p.sequence.join(" → ")}（${p.sessionCount} 次）`);
+                if (p.errors?.length) lines.push(`    常见错误：${p.errors[0].slice(0, 80)}`);
+                lines.push("");
+              }
             }
           }
         }
@@ -480,8 +549,112 @@ export default class ContinuousPresencePlugin {
       },
     });
 
-    // 注册第四个工具：node_id 解析
+    // 注册第四个工具：上下文探针（渐进披露 L1 — 顶层摘要）
     const unreg4 = this.ctx.registerTool({
+      name: "probe-context",
+      description:
+        "[渐进披露 L1] 快速探测当前会话上下文，返回最相关的场景块摘要。" +
+        "这是最轻量的调用——只返回场景标题、话题和重要性评分，不返回全文。" +
+        "适合在对话开始时或话题切换时调用，快速了解有哪些已知经验可以复用。" +
+        "如果需要进一步查看某个场景的详情，再用 scene-search 工具的 includeContent 参数下钻。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "查询内容（可选，不填则返回最重要的场景）",
+          },
+          maxResults: {
+            type: "number",
+            description: "最大返回条数（默认 10）",
+          },
+          minImportance: {
+            type: "number",
+            description: "最低重要性过滤（1-10，默认不限制）",
+          },
+        },
+      },
+      execute: async (input, toolCtx) => {
+        const scenes = this.#sceneBuilder?.listScenes() || [];
+        if (scenes.length === 0) {
+          return { content: [{ type: "text", text: "场景块索引还未建立。" }] };
+        }
+
+        const query = (input.query || "").toLowerCase().trim();
+        const maxResults = Math.min(input.maxResults || 10, 30);
+        const minImportance = input.minImportance || 0;
+
+        let candidates = scenes.filter(s => !s.archived && s.importance >= minImportance);
+
+        if (query) {
+          const queryWords = query.split(/\s+/).filter(Boolean);
+          candidates = candidates
+            .map(scene => {
+              let score = 0;
+              for (const qw of queryWords) {
+                if ((scene.title || "").toLowerCase().includes(qw)) score += 5;
+                if ((scene.topics || []).some(t => t.toLowerCase().includes(qw))) score += 3;
+                if ((scene.tools || []).some(t => t.toLowerCase().includes(qw))) score += 2;
+              }
+              return { scene, score };
+            })
+            .filter(x => x.score > 0)
+            .sort((a, b) => b.score - a.score || b.scene.importance - a.scene.importance);
+        } else {
+          candidates = candidates
+            .map(scene => ({ scene, score: scene.importance }))
+            .sort((a, b) => b.scene.importance - a.scene.importance);
+        }
+
+        const top = candidates.slice(0, maxResults);
+
+        if (top.length === 0) {
+          return { content: [{ type: "text", text: `没有找到匹配的场景块。` }] };
+        }
+
+        const lines = [];
+        lines.push(`📊 上下文雷达（匹配 ${top.length} 个场景块）\n`);
+        lines.push("这是已知经验的顶层摘要。如需查看某个场景的详情，调 scene-search 并用 includeContent 下钻。");
+        lines.push("如需追溯原文，用 resolve-node。\n");
+
+        // 按重要性分组显示
+        const buckets = { high: [], medium: [], low: [] };
+        for (const { scene, score } of top) {
+          const entry = `  ${scene.title} [${scene.importance}/10]  (${scene.sessions}次会话, ${scene.errors}个踩坑)  — ${(scene.topics || []).slice(0, 4).join(", ")}`;
+          if (scene.importance >= 8) buckets.high.push(entry);
+          else if (scene.importance >= 5) buckets.medium.push(entry);
+          else buckets.low.push(entry);
+        }
+
+        if (buckets.high.length > 0) {
+          lines.push(`🔴 高相关度（${buckets.high.length}）：`);
+          lines.push(...buckets.high);
+          lines.push("");
+        }
+        if (buckets.medium.length > 0) {
+          lines.push(`🟡 中等相关度（${buckets.medium.length}）：`);
+          lines.push(...buckets.medium);
+          lines.push("");
+        }
+        if (buckets.low.length > 0) {
+          lines.push(`🟢 低相关度（${buckets.low.length}）：`);
+          lines.push(...buckets.low);
+          lines.push("");
+        }
+
+        lines.push(`📌 渐进披露层级：`);
+        lines.push(`  L1 顶层摘要 ← 当前视图（场景标题 + 话题）`);
+        lines.push(`  L2 场景详情 → 调 scene-search(includeContent: true)`);
+        lines.push(`  L3 原文追溯 → 调 resolve-node(nodeId)`);
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      },
+    });
+
+    // 清理函数注册推迟到所有工具注册完成后
+
+    // 注册第五个工具：node_id 解析（渐进披露 L3 — 底层追溯）
+    const unreg5 = this.ctx.registerTool({
       name: "resolve-node",
       description:
         "通过 node_id 追溯消息原文。每条消息有一个唯一 node_id（格式：{sessionId}:{messageId}），" +
@@ -562,6 +735,7 @@ export default class ContinuousPresencePlugin {
     this.register(unreg2);
     this.register(unreg3);
     this.register(unreg4);
+    this.register(unreg5);
 
     this.#log.info("continuous-presence ready");
   }
