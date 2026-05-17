@@ -28,6 +28,37 @@ Hanako 内置的**记忆系统**（Memory）和这个插件是互补关系，不
 
 两者共同作用时，AI 既记得你的偏好，也记得自己过去怎么帮你解决问题的——这才是完整的「持续存在」。
 
+## 三层记忆架构
+
+Continuous Presence 借鉴了分层记忆设计，将对话经验组织为三个递进层级：
+
+```
+L3  原文追溯          ← 精确到单条消息的原文定位
+     resolve-node(sessionId:messageId)
+     ⬆ 仅当需要核实细节时
+
+L2  场景/会话详情      ← 主题聚合 + 会话级记录
+     scene-search()   → 完整场景块 Markdown
+     recall-context() → 会话摘要 + 工具模式 + 踩坑
+     ⬆ 按需下钻
+
+L1  顶层摘要           ← 默认视图，极轻量
+     probe-context()  → 场景标题/话题/重要性雷达
+     ⬆ 对话开始时自动探测
+```
+
+每一层都可以被追溯：场景块引用来源会话，会话引用原始消息。
+
+### 渐进式披露
+
+不是一次性把所有经验灌入上下文，而是由浅入深：
+
+1. **L1 探针**（~20 tokens）——对话开始时快速扫描，确认有哪些已知经验
+2. **L2 场景详情**（~数百 tokens）——发现相关场景后，读取完整场景块
+3. **L3 原文追溯**（精确到条）——只有需要核实某条消息原话时才调用
+
+默认只走 L1。需要时再下钻，不需要时不展开。
+
 ## 原理
 
 直接读取 Hanako 本地保存的 `.jsonl` 会话文件（`~/.hanako/agents/hanako/sessions/`），解析每轮对话的结构化数据：
@@ -40,6 +71,45 @@ Hanako 内置的**记忆系统**（Memory）和这个插件是互补关系，不
 - **工具-错误关联**：记录每个工具最常见的报错
 
 索引只存元数据，不存对话原文。
+
+## 场景块（Scene Blocks）
+
+在会话索引的基础上，Continuous Presence 自动将相关话题的会话聚合成**场景块**——主题化的 Markdown 文件，介于原始会话和用户画像之间的中间记忆层。
+
+### 聚类算法
+
+使用 **IDF 加权特征聚类**：
+
+1. 从每段会话中提取工具特征、关键词、话题
+2. 计算 IDF（逆文档频率），抑制 `bash`/`read`/`ls` 等全通用工具的权重
+3. 基于加权余弦相似度，用连通分量将相关会话聚类
+4. 每个聚类生成一个场景块
+
+### 场景块内容
+
+每个场景块是一个 Markdown 文件（`scene_blocks/*.md`），包含：
+
+- **YAML 元数据**：ID、标题、话题标签、工具列表、重要性评分、创建/更新时间
+- **场景概述**：该话题的核心描述
+- **核心话题**：话题标签列表
+- **工具使用模式**：高频工具序列模式
+- **常见踩坑**：该话题下反复出现的错误
+- **相关会话**：引用到具体会话文件，附带 `node_id` 可追溯路径
+- **可追溯来源**：所有涉及会话的 session_id 汇总，可通过 `resolve-node` 追溯到原文
+
+### 增量更新
+
+场景块每小时自动重建一次，与 15 分钟增量扫描解耦。可通过 `continuous-presence:rebuild-scenes` bus handler 手动触发。
+
+## node_id 精准追溯
+
+每条消息在会话文件中都有唯一标识。Continuous Presence 建立了 `session_id:message_id` 格式的 node_id 引用体系：
+
+- **格式**：`{sessionId}:{messageId}`（如 `019e00cc-4786-726d-a126-d67721cfc818:504c4d9f`）
+- **解析**：按 session_id 定位文件 → 按 message_id 定位行 → 返回原文
+- **上下文**：支持获取消息前后的对话上下文（`contextLines` 参数）
+- **短 ID 支持**：支持 session_id 前 8 位作为短引用
+- **可追溯链路**：场景块 → 会话 → 消息原文，每一层都可精确回溯
 
 ## 工作流模式
 
@@ -56,12 +126,27 @@ Continuous Presence 不仅记录「用过什么工具」，还能发现**工具�
 
 ## 提供的工具
 
+### 渐进披露 L1 — 顶层摘要
+
 | 工具 | 说明 |
 |---|---|
-| `continuous-presence_recall-context` | 查询过去对话经验。输入话题，返回相关历史会话及其摘要、工具使用、踩坑记录，以及相关工作流模式 |
-| `continuous-presence_session-summary` | 查看今日/本周/本月会话概览，包含统计数据和会话列表，以及常见工作流模式排名 |
+| `continuous-presence_probe-context` | 对话上下文探针。返回最相关的场景块标题、话题和重要性评分。**极轻量**（~20 tokens），适合对话开始时快速扫描 |
 
-两个工具**只在你或 AI 主动调用时才生效**，不做未经同意的上下文注入。
+### 渐进披露 L2 — 场景/会话详情
+
+| 工具 | 说明 |
+|---|---|
+| `continuous-presence_recall-context` | 查询历史会话经验。支持三层输出详略：`detail=scene`（场景摘要，默认）\| `session`（会话级详情）\| `full`（完整输出）。返回场景块、会话记录、工具模式、踩坑 |
+| `continuous-presence_scene-search` | 按话题搜索场景块。支持 `includeContent` 参数控制是否返回完整 Markdown 场景块内容 |
+| `continuous-presence_session-summary` | 今日/本周/本月会话概览。包含统计数据、会话列表和常见工作流模式排名 |
+
+### 渐进披露 L3 — 原文追溯
+
+| 工具 | 说明 |
+|---|---|
+| `continuous-presence_resolve-node` | 按 `node_id` 追踪消息原文。支持 `contextLines` 参数获取前后文。是三层链路的底层证据层 |
+
+所有工具**只在你或 AI 主动调用时才生效**，不做未经同意的上下文注入。
 
 ## 安装
 
@@ -81,7 +166,22 @@ Continuous Presence 不仅记录「用过什么工具」，还能发现**工具�
 - **所有数据本地处理**，不发送任何网络请求
 - 只读取会话文件的元数据（话题、工具名、错误记录），不存储对话原文
 - 索引文件位于 `plugin-data/continuous-presence/index.json`，属于你的私人数据
+- 场景块文件位于 `plugin-data/continuous-presence/scene_blocks/*.md`，可直接打开查看和手动编辑
 - 插件本身不包含任何个人信息，可放心开源
+
+### 存储结构
+
+```
+plugin-data/continuous-presence/
+├── index.json                    # 会话经验索引（版本 3）
+├── scene_blocks/
+│   ├── index.json                # 场景块索引（元数据 + 重要性评分）
+│   ├── scene-搜索工具.md          # Markdown 场景块
+│   ├── scene-MCP配置.md
+│   └── ...                       # ~30 个活跃场景块
+```
+
+所有数据都是可读的文本文件，没有黑盒。
 
 ## 许可证
 
