@@ -837,24 +837,43 @@ export default class ContinuousPresencePlugin {
       pinnedMd = await fsp.readFile(pinnedPath, "utf-8");
     } catch {}
 
-    // 尝试读取 LLM 配置（从 OpenClaw 配置或环境变量）
+    // 尝试读取 LLM 配置（从 Hanako 的 added-models.yaml）
     let llmConfig = null;
     if (useLlm) {
       try {
-        const openclawConfigPath = path.join(process.env.HOME || "", ".openclaw", "openclaw.json");
-        const raw = await fsp.readFile(openclawConfigPath, "utf-8");
-        const config = JSON.parse(raw);
-        const provider = config?.models?.providers?.opencode;
-        if (provider?.baseUrl && provider?.apiKey) {
+        const { parseYaml } = await import("./lib/yaml-parse.js");
+        const yamlPath = path.join(process.env.HOME || "", ".hanako", "added-models.yaml");
+        const raw = await fsp.readFile(yamlPath, "utf-8");
+        const config = parseYaml(raw);
+        const providers = config?.providers || {};
+
+        // 找第一个有 baseUrl + apiKey 的 OpenAI-compatible provider
+        let chosen = null;
+        for (const [name, p] of Object.entries(providers)) {
+          if (p?.base_url && p?.api_key && (p?.api === "openai-completions" || !p?.api)) {
+            chosen = { name, ...p };
+            break;
+          }
+        }
+
+        if (chosen) {
+          const modelList = Array.isArray(chosen.models)
+            ? chosen.models.map(m => (typeof m === "string" ? m : m?.id)).filter(Boolean)
+            : [];
+          const model = modelList.includes("deepseek-v4-flash") ? "deepseek-v4-flash"
+            : modelList[0] || "deepseek-v4-flash";
+
           llmConfig = {
-            baseUrl: provider.baseUrl.replace(/\/+$/, ""),
-            apiKey: provider.apiKey,
-            model: provider.models?.[0]?.id || "deepseek-v4-flash",
+            baseUrl: chosen.base_url.replace(/\/+$/, ""),
+            apiKey: chosen.api_key,
+            model,
           };
-          this.#log?.info("[persona] LLM config loaded from openclaw.json");
+          this.#log?.info(`[persona] LLM config loaded from added-models.yaml (provider: ${chosen.name}, model: ${model})`);
+        } else {
+          this.#log?.warn("[persona] no suitable LLM provider found in added-models.yaml");
         }
       } catch (err) {
-        this.#log?.warn(`[persona] failed to load LLM config: ${err.message}`);
+        this.#log?.warn(`[persona] failed to load LLM config from added-models.yaml: ${err.message}`);
       }
     }
 
